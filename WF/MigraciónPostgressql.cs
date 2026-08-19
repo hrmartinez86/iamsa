@@ -37,7 +37,7 @@ namespace ENV.Data
 
             sql = ChangeHourFormat(sql);
 
-            
+            sql = PostgresHelper.ReplaceConcatOperator(sql);
 
             if (sql.IndexOf("GLOBAL TEMPORARY") > 0)
             {
@@ -86,7 +86,7 @@ namespace ENV.Data
 
             if (sql.Contains("LISTAGG"))
             {
-                sql = Remplazar(sql, "LISTAGG", "STRING_AGG");
+                sql = PostgresHelper.ReplaceListAgg(sql, true);
             }
 
             if (sql.Contains("DATE("))
@@ -94,7 +94,6 @@ namespace ENV.Data
                 sql = Remplazar(sql, "DATE(", "Fecha_texto(");
             }
 
-            // NUEVO: Convertir NVL a COALESCE antes de VALUE
             if (sql.Contains("NVL("))
             {
                 sql = Reemplazar(sql, "NVL(", "COALESCE(");
@@ -188,7 +187,7 @@ namespace ENV.Data
                     {
                         // Preservar espacios en blanco que pudieran existir
                         string nuevoValor = valorLimpio == "1" ? "True" : "False";
-                        
+
                         // Si el valor original tenía espacios al final, preservar la estructura
                         if (valorOriginal.EndsWith(" ") && !valorOriginal.Trim().Equals(valorOriginal))
                         {
@@ -196,7 +195,7 @@ namespace ENV.Data
                             int espaciosFinales = valorOriginal.Length - valorOriginal.TrimEnd().Length;
                             nuevoValor = nuevoValor + new string(' ', espaciosFinales);
                         }
-                        
+
                         valoresConvertidos.Add(nuevoValor);
                     }
                     else
@@ -207,11 +206,11 @@ namespace ENV.Data
 
                 // Reconstruir el SQL
                 string nuevosValores = string.Join(",", valoresConvertidos);
-                string sqlModificado = sql.Replace(
-                    $"VALUES({valoresStr})",
-                    $"VALUES({nuevosValores})"
-                );
-
+                //string sqlModificado = sql.Replace(
+                //    $"VALUES({valoresStr})",
+                //    $"VALUES({nuevosValores})"
+                //);
+                string sqlModificado = SustitucionCambiosInsert(sql, match, nuevosValores);
                 return sqlModificado;
             }
             catch (Exception)
@@ -831,31 +830,134 @@ namespace ENV.Data
         /// <summary>
         /// Cambiar formato de hora HH.mm.ss(DB2) a HH:mm:ss(Postgres)
         /// Solo convierte valores que sean claramente horas (00-23 para horas)
+        /// y solo si la columna correspondiente comienza con H en un INSERT
         /// </summary>
         /// <param name="sql"></param>
         /// <returns></returns>
         public string ChangeHourFormat(string sql)
         {
-            if (string.IsNullOrWhiteSpace(sql))
+
+            // Si NO es un INSERT, aplicar conversión normal (comportamiento anterior)
+            if (!sql.ToUpper().Contains("INSERT INTO"))
+            {
+                // Patrón 1: Formato completo dentro de comillas '18.51.30' -> '18:51:30'
+                Regex regHourFull = new Regex(
+                    @"'([01]\d|2[0-3])\.([0-5]\d)\.([0-5]\d)'",
+                    RegexOptions.Compiled
+                );
+                sql = regHourFull.Replace(sql, "'$1:$2:$3'");
+
+                // Patrón 2: Formato corto dentro de comillas '18.51' -> '18:51:00'
+                Regex regHourShort = new Regex(
+                    @"'([01]\d|2[0-3])\.([0-5]\d)'",
+                    RegexOptions.Compiled
+                );
+                sql = regHourShort.Replace(sql, "'$1:$2:00'");
+
                 return sql;
+            }
 
-            // Patrón 1: Formato completo dentro de comillas '18.51.30' -> '18:51:30'
-            // Solo convierte si está entre comillas simples
-            Regex regHourFull = new Regex(
-                @"'([01]\d|2[0-3])\.([0-5]\d)\.([0-5]\d)'",
-                RegexOptions.Compiled
-            );
-            sql = regHourFull.Replace(sql, "'$1:$2:$3'");
+            // Si ES un INSERT, validar columnas que empiecen con H
+            try
+            {
+                // Detectar la sección de columnas y valores
+                var regexInsert = new Regex(
+                    @"INSERT\s+INTO\s+[\w.]+\s*\((.*?)\)\s*VALUES\s*\((.*?)\)",
+                    RegexOptions.IgnoreCase | RegexOptions.Singleline
+                );
 
-            // Patrón 2: Formato corto dentro de comillas '18.51' -> '18:51:00'
-            // Solo convierte si está entre comillas simples Y no tiene más dígitos antes o después
-            Regex regHourShort = new Regex(
-                @"'([01]\d|2[0-3])\.([0-5]\d)'",
-                RegexOptions.Compiled
-            );
-            sql = regHourShort.Replace(sql, "'$1:$2:00'");
+                var match = regexInsert.Match(sql);
+                if (!match.Success)
+                    return sql; // No se puede parsear, devolver sin cambios
 
-            return sql;
+                string columnasStr = match.Groups[1].Value;
+                string valoresStr = match.Groups[2].Value;
+
+                // Separar columnas
+                var columnas = columnasStr.Split(',')
+                    .Select(c => c.Trim().ToUpper())
+                    .ToList();
+
+                // Separar valores
+                var valores = SepararValores(valoresStr);
+
+                if (columnas.Count != valores.Count)
+                    return sql; // No coinciden, no modificar
+
+                // Convertir valores de hora solo para columnas que empiecen con H
+                List<string> valoresConvertidos = new List<string>();
+                for (int i = 0; i < columnas.Count; i++)
+                {
+                    string columna = columnas[i];
+                    string valorOriginal = valores[i];
+                    string valorConvertido = valorOriginal;
+
+                    // Solo convertir si la columna empieza con H
+                    if (columna.StartsWith("H"))
+                    {
+                        // Aplicar conversión de formato de hora
+                        // Patrón 1: '18.51.30' -> '18:51:30'
+                        Regex regHourFull = new Regex(
+                            @"'([01]\d|2[0-3])\.([0-5]\d)\.([0-5]\d)'",
+                            RegexOptions.Compiled
+                        );
+                        valorConvertido = regHourFull.Replace(valorConvertido, "'$1:$2:$3'");
+
+                        // Patrón 2: '18.51' -> '18:51:00'
+                        Regex regHourShort = new Regex(
+                            @"'([01]\d|2[0-3])\.([0-5]\d)'",
+                            RegexOptions.Compiled
+                        );
+                        valorConvertido = regHourShort.Replace(valorConvertido, "'$1:$2:00'");
+                    }
+
+                    valoresConvertidos.Add(valorConvertido);
+                }
+
+                // Reconstruir el SQL solo si hubo cambios
+                string nuevosValores = string.Join(",", valoresConvertidos);
+                if (nuevosValores != valoresStr)
+                {
+                    sql=SustitucionCambiosInsert(sql, match, nuevosValores);
+                }
+
+                return sql;
+            }
+            catch (Exception)
+            {
+                // Si hay algún error en el parsing, devolver SQL original sin cambios
+                return sql;
+            }
+        }
+
+        public string SustitucionCambiosInsert(string sql,Match match,string nuevosValores)
+        {
+            try
+            {
+                // Encontrar "VALUES" y luego el primer "(" después de él
+                int posValues = sql.IndexOf("VALUES", match.Index, StringComparison.OrdinalIgnoreCase);
+                if (posValues >= 0)
+                {
+                    // Buscar el paréntesis de apertura después de VALUES
+                    int posParenApertura = sql.IndexOf('(', posValues);
+                    if (posParenApertura >= 0)
+                    {
+                        // Inicio = posición después del (
+                        int inicioValues = posParenApertura + 1;
+
+                        // Fin = posición del ) de cierre (desde el match)
+                        int finValues = match.Index + match.Length - 1;
+
+                        // Reconstruir: parte antes de ( + nuevosValores + ) + resto
+                        sql = sql.Substring(0, inicioValues) + nuevosValores + sql.Substring(finValues);
+                    }
+                }
+                return sql;
+            }
+            catch(Exception)
+            {
+                return sql;
+            }
         }
 
         public string CambiarBoolEspacio(string sql)
@@ -879,13 +981,11 @@ namespace ENV.Data
             {
                 sql = sql.Replace("X'00 '", "False");
             }
-
             // Convertir valores booleanos en INSERT basándose en nombres de columnas
             if (sql.ToUpper().Contains("INSERT INTO") && sql.ToUpper().Contains("VALUES"))
             {
                 sql = ConvertirBooleanosEnInsert(sql);
             }
-
             return sql;
         }
 
