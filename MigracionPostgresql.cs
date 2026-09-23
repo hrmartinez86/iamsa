@@ -1227,9 +1227,7 @@ namespace ENV.Data
                 string valoresStr = match.Groups[2].Value;
 
                 // Separar columnas
-                var columnas = columnasStr.Split(',')
-                    .Select(c => c.Trim().ToUpper())
-                    .ToList();
+                var columnas = columnasStr.Split(',').Select(c => c.Trim().ToUpper()).ToList();
 
                 // Separar valores
                 var valores = SepararValores(valoresStr);
@@ -1248,20 +1246,13 @@ namespace ENV.Data
                     // Solo convertir si la columna empieza con H
                     if (columna.StartsWith("H"))
                     {
-                        // Aplicar conversión de formato de hora
-                        // Patrón 1: '18.51.30' -> '18:51:30'
-                        Regex regHourFull = new Regex(
-                            @"'([01]\d|2[0-3])\.([0-5]\d)\.([0-5]\d)'",
-                            RegexOptions.Compiled
-                        );
-                        valorConvertido = regHourFull.Replace(valorConvertido, "'$1:$2:$3'");
-
-                        // Patrón 2: '18.51' -> '18:51:00'
-                        Regex regHourShort = new Regex(
-                            @"'([01]\d|2[0-3])\.([0-5]\d)'",
-                            RegexOptions.Compiled
-                        );
-                        valorConvertido = regHourShort.Replace(valorConvertido, "'$1:$2:00'");
+                        // Formatear hora robustamente
+                        string formatted = FormatHourValue(valorOriginal);
+                        // Si FormatHourValue devolvió null significa que no se pudo parsear; mantener original
+                        if (formatted != null)
+                            valorConvertido = $"'{formatted}'";
+                        else
+                            valorConvertido = valorOriginal;
                     }
 
                     valoresConvertidos.Add(valorConvertido);
@@ -1271,7 +1262,7 @@ namespace ENV.Data
                 string nuevosValores = string.Join(",", valoresConvertidos);
                 if (nuevosValores != valoresStr)
                 {
-                    sql=SustitucionCambiosInsert(sql, match, nuevosValores);
+                    sql = SustitucionCambiosInsert(sql, match, nuevosValores);
                 }
 
                 return sql;
@@ -1281,6 +1272,119 @@ namespace ENV.Data
                 // Si hay algún error en el parsing, devolver SQL original sin cambios
                 return sql;
             }
+        }
+
+        /// <summary>
+        /// Intenta parsear y normalizar un valor de hora (que puede venir en formatos DB2 como '13.11', '13.11.11', '1311', etc.)
+        /// Devuelve string en formato "HH:mm:ss" si pudo normalizar, o null si no pudo.
+        /// </summary>
+        /// <param name="valorOriginal">Valor exacto extraído del INSERT (incluye comillas si las tiene)</param>
+        /// <returns>Hora normalizada "HH:mm:ss" o null</returns>
+        private string FormatHourValue(string valorOriginal)
+        {
+            if (string.IsNullOrWhiteSpace(valorOriginal))
+                return null;
+
+            // Eliminar comillas simples y espacios extremos
+            string s = valorOriginal.Trim();
+            if (s.StartsWith("'") && s.EndsWith("'") && s.Length >= 2)
+                s = s.Substring(1, s.Length - 2).Trim();
+
+            if (string.IsNullOrEmpty(s))
+                return null;
+
+            // Si ya contiene ':' intentar validar
+            if (s.Contains(":"))
+            {
+                var parts = s.Split(':');
+                int hh = 0, mm = 0, ss = 0;
+                if (parts.Length >= 2 &&
+                    int.TryParse(parts[0], out hh) &&
+                    int.TryParse(parts[1], out mm))
+                {
+                    if (parts.Length >= 3)
+                        int.TryParse(parts[2], out ss);
+
+                    if (IsValidTime(hh, mm, ss))
+                        return $"{hh:D2}:{mm:D2}:{ss:D2}";
+                }
+                return null;
+            }
+
+            // Si contiene '.' reemplazar por ':' y reutilizar
+            if (s.Contains("."))
+            {
+                var rep = s.Replace('.', ':');
+                var parts = rep.Split(':');
+                int hh = 0, mm = 0, ss = 0;
+                if (parts.Length >= 2 &&
+                    int.TryParse(parts[0], out hh) &&
+                    int.TryParse(parts[1], out mm))
+                {
+                    if (parts.Length >= 3)
+                        int.TryParse(parts[2], out ss);
+
+                    if (IsValidTime(hh, mm, ss))
+                        return $"{hh:D2}:{mm:D2}:{ss:D2}";
+                }
+                // si falla, seguir a parseo por dígitos
+            }
+
+            // Si sólo son dígitos como 1311, 131111, 11111, etc.
+            var digits = new string(s.Where(char.IsDigit).ToArray());
+            if (digits.Length >= 3)
+            {
+                try
+                {
+                    int hh = 0, mm = 0, ss = 0;
+                    if (digits.Length == 4) // 1311 -> 13:11:00
+                    {
+                        hh = int.Parse(digits.Substring(0, 2));
+                        mm = int.Parse(digits.Substring(2, 2));
+                        ss = 0;
+                    }
+                    else if (digits.Length == 6) // 131111 -> 13:11:11
+                    {
+                        hh = int.Parse(digits.Substring(0, 2));
+                        mm = int.Parse(digits.Substring(2, 2));
+                        ss = int.Parse(digits.Substring(4, 2));
+                    }
+                    else if (digits.Length == 5) // 13111 -> 1:31:11 (intento razonable)
+                    {
+                        hh = int.Parse(digits.Substring(0, 1));
+                        mm = int.Parse(digits.Substring(1, 2));
+                        ss = int.Parse(digits.Substring(3, 2));
+                    }
+                    else if (digits.Length == 3) // 811 -> 0:08:11
+                    {
+                        hh = 0;
+                        mm = int.Parse(digits.Substring(0, 1));
+                        ss = int.Parse(digits.Substring(1, 2));
+                    }
+                    else // otros casos: intentar tomar últimos 4 como mmss y el resto hh
+                    {
+                        var last4 = digits.Substring(digits.Length - 4);
+                        var rest = digits.Substring(0, digits.Length - 4);
+                        hh = rest.Length > 0 ? int.Parse(rest) : 0;
+                        mm = int.Parse(last4.Substring(0, 2));
+                        ss = int.Parse(last4.Substring(2, 2));
+                    }
+
+                    if (IsValidTime(hh, mm, ss))
+                        return $"{hh:D2}:{mm:D2}:{ss:D2}";
+                }
+                catch
+                {
+                    // ignore y retornar null abajo
+                }
+            }
+
+            return null;
+        }
+
+        private bool IsValidTime(int hh, int mm, int ss)
+        {
+            return hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 && ss >= 0 && ss <= 59;
         }
 
         public string SustitucionCambiosInsert(string sql,Match match,string nuevosValores)
